@@ -2,7 +2,7 @@ import os
 import time
 import logging
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Any, Dict, List, Tuple, Optional
 
 import requests
@@ -16,13 +16,13 @@ from google.oauth2.service_account import Credentials
 # CONFIG
 # -----------------------
 SHIPSTATION_BASE = "https://ssapi.shipstation.com"
-# list fulfillments (shipDateStart/End)
 FULFILLMENTS_URL = f"{SHIPSTATION_BASE}/fulfillments"
-ORDER_URL = f"{SHIPSTATION_BASE}/orders"               # get order by id
+ORDER_URL = f"{SHIPSTATION_BASE}/orders"
 
 SHEET_ID = "1W5SooGZjqZ83cTLdDmOW6UXoEi9_FLIUKMsRxaIs9oU"
 TAB_RAW = "RAW_LINES"
 TAB_AGG = "MONTHLY_SKU"
+TAB_MATRIX = "FORECAST_MATRIX"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -68,6 +68,32 @@ def parse_ss_dt(s: str) -> Optional[datetime]:
 
 def month_key(dt: datetime) -> str:
     return dt.strftime("%Y-%m")
+
+
+def month_label(dt: datetime) -> str:
+    # Formato como en el ejemplo: "February 2026" o corto "Feb 2026"
+    fmt = os.environ.get("FORECAST_MONTH_LABEL", "short").strip().lower()
+    return dt.strftime("%b %Y") if fmt == "short" else dt.strftime("%B %Y")
+
+
+def iter_month_starts(start_date: str, end_date: str) -> List[datetime]:
+    """
+    Devuelve una lista de fechas (1er día del mes) desde start_date hasta end_date inclusive.
+    """
+    sdt = datetime.fromisoformat(start_date)
+    edt = datetime.fromisoformat(end_date)
+
+    cur = sdt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = edt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    out = []
+    while cur <= end:
+        out.append(cur)
+        # sumar 1 mes sin librerías extra
+        y = cur.year + (cur.month // 12)
+        m = (cur.month % 12) + 1
+        cur = cur.replace(year=y, month=m)
+    return out
 
 
 def shipstation_get(url: str, params: Dict[str, Any], auth: Tuple[str, str], retries: int = 4) -> Dict[str, Any]:
@@ -155,6 +181,11 @@ def overwrite_worksheet(ws, values: List[List[Any]]):
         ws.update(values, value_input_option="RAW")
 
 
+def best_mpn_for_item(item: Dict[str, Any]) -> str:
+    # “MPN” según vuestro criterio previo: warehouseLocation o fulfillmentSku
+    return (item.get("warehouseLocation") or item.get("fulfillmentSku") or "").strip()
+
+
 def main():
     load_dotenv()
 
@@ -164,10 +195,8 @@ def main():
 
     sa_path = require_env("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # defaults
     months_back = int(os.environ.get("FORECAST_MONTHS_BACK", "12"))
     progress_every = int(os.environ.get("FORECAST_PROGRESS_EVERY", "200"))
-    # Para pruebas: limita el nº de orders únicos a procesar (0 = sin límite)
     max_orders = int(os.environ.get("FORECAST_MAX_ORDERS", "0"))
 
     today = datetime.now()
@@ -183,11 +212,7 @@ def main():
     fulfillments = list_fulfillments(ship_start, ship_end, auth=auth)
     logger.info(f"Phase 1 done (fulfillments). elapsed={time.time()-t0:.1f}s")
 
-    # ------------------------------------
-    # Optimización clave:
-    # Agrupar por orderId y escoger shipDate representativo por order
-    # (usamos el shipDate más reciente visto para el orderId)
-    # ------------------------------------
+    # Agrupar por orderId y tomar shipDate más reciente por orderId
     t1 = time.time()
     order_shipdate: Dict[str, datetime] = {}
     for f in fulfillments:
@@ -200,7 +225,7 @@ def main():
         if (prev is None) or (sd > prev):
             order_shipdate[oid_s] = sd
 
-    unique_orders = list(order_shipdate.items())  # [(orderId, shipDate), ...]
+    unique_orders = list(order_shipdate.items())
     logger.info(f"Unique orders from fulfillments: {len(unique_orders)}")
     logger.info(
         f"Phase 2 done (group by orderId). elapsed={time.time()-t1:.1f}s")
@@ -213,13 +238,20 @@ def main():
     # Cache de orders
     order_cache: Dict[str, Dict[str, Any]] = {}
 
-    raw_rows: List[List[Any]] = [
-        ["ShipDate", "Month", "OrderNumber", "OrderId", "SKU", "Qty"]]
+    # RAW + AGG
+    raw_rows: List[List[Any]] = [["ShipDate", "Month",
+                                  "OrderNumber", "OrderId", "SKU", "Qty", "MPN"]]
     agg: Dict[Tuple[str, str], int] = defaultdict(int)
 
-    # ------------------------------------
+    # Para matriz: SKU x Month -> Qty
+    pivot: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    # Para MPN por SKU: elegimos el más frecuente observado
+    mpn_counter_by_sku: Dict[str, Counter] = defaultdict(Counter)
+
+    # -------------------------
     # Descarga orders (fase lenta) + progreso
-    # ------------------------------------
+    # -------------------------
     t2 = time.time()
     for i, (order_id, ship_dt) in enumerate(unique_orders, start=1):
         order = get_order(order_id, auth=auth, cache=order_cache)
@@ -238,15 +270,23 @@ def main():
             except (TypeError, ValueError):
                 qty = 0
 
+            mpn = best_mpn_for_item(it)
+
             raw_rows.append([
                 ship_dt.strftime("%Y-%m-%d"),
                 mkey,
                 order_number,
                 str(order_id),
                 sku,
-                qty
+                qty,
+                mpn,
             ])
+
             agg[(mkey, sku)] += qty
+            pivot[sku][mkey] += qty
+
+            if mpn:
+                mpn_counter_by_sku[sku][mpn] += 1
 
         if progress_every and (i % progress_every == 0):
             logger.info(
@@ -255,19 +295,44 @@ def main():
 
     logger.info(f"Phase 3 done (orders->lines). elapsed={time.time()-t2:.1f}s")
 
+    # AGG rows (long)
     agg_rows: List[List[Any]] = [["Month", "SKU", "QtyShipped"]]
     for (m, sku), qty in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
         agg_rows.append([m, sku, qty])
 
-    # ------------------------------------
+    # MATRIX rows (wide)
+    month_starts = iter_month_starts(ship_start, ship_end)
+    month_keys = [dt.strftime("%Y-%m") for dt in month_starts]
+    month_labels = [month_label(dt) for dt in month_starts]
+
+    matrix_rows: List[List[Any]] = []
+    header = ["SKU", "MPN"] + month_labels
+    matrix_rows.append(header)
+
+    for sku in sorted(pivot.keys()):
+        # MPN “mejor” (más frecuente)
+        mpn = ""
+        if sku in mpn_counter_by_sku and mpn_counter_by_sku[sku]:
+            mpn = mpn_counter_by_sku[sku].most_common(1)[0][0]
+
+        row = [sku, mpn]
+        sku_months = pivot.get(sku, {})
+        for mk in month_keys:
+            row.append(int(sku_months.get(mk, 0)))
+        matrix_rows.append(row)
+
+    # -------------------------
     # Write to Google Sheets
-    # ------------------------------------
+    # -------------------------
     t3 = time.time()
     sh = connect_sheet(sa_path)
+
     ws_raw = ensure_tab(sh, TAB_RAW, rows=max(
-        1000, len(raw_rows) + 100), cols=10)
+        1000, len(raw_rows) + 100), cols=12)
     ws_agg = ensure_tab(sh, TAB_AGG, rows=max(
         1000, len(agg_rows) + 100), cols=10)
+    ws_matrix = ensure_tab(sh, TAB_MATRIX, rows=max(
+        1000, len(matrix_rows) + 100), cols=max(10, len(header) + 2))
 
     logger.info(f"Writing {TAB_RAW} rows={len(raw_rows)-1}")
     overwrite_worksheet(ws_raw, raw_rows)
@@ -276,7 +341,12 @@ def main():
     overwrite_worksheet(ws_agg, agg_rows)
 
     logger.info(
-        f"Done. RAW_LINES rows={len(raw_rows)-1}, MONTHLY_SKU rows={len(agg_rows)-1} | write_elapsed={time.time()-t3:.1f}s"
+        f"Writing {TAB_MATRIX} rows={len(matrix_rows)-1} cols={len(header)}")
+    overwrite_worksheet(ws_matrix, matrix_rows)
+
+    logger.info(
+        f"Done. RAW_LINES rows={len(raw_rows)-1}, MONTHLY_SKU rows={len(agg_rows)-1}, "
+        f"FORECAST_MATRIX rows={len(matrix_rows)-1} | write_elapsed={time.time()-t3:.1f}s"
     )
     logger.info(f"TOTAL elapsed={time.time()-t0:.1f}s")
 
