@@ -18,8 +18,10 @@ from google.oauth2.service_account import Credentials
 SHIPSTATION_BASE = "https://ssapi.shipstation.com"
 FULFILLMENTS_URL = f"{SHIPSTATION_BASE}/fulfillments"
 ORDER_URL = f"{SHIPSTATION_BASE}/orders"
+PRODUCT_URL = f"{SHIPSTATION_BASE}/products"
 
 SHEET_ID = "1W5SooGZjqZ83cTLdDmOW6UXoEi9_FLIUKMsRxaIs9oU"
+
 TAB_RAW = "RAW_LINES"
 TAB_AGG = "MONTHLY_SKU"
 TAB_MATRIX = "FORECAST_MATRIX"
@@ -55,6 +57,7 @@ def parse_ss_dt(s: str) -> Optional[datetime]:
     if not s:
         return None
     s = s.strip()
+    # normaliza fractional seconds si existen
     if "." in s:
         left, right = s.split(".", 1)
         digits = "".join(ch for ch in right if ch.isdigit())
@@ -71,14 +74,14 @@ def month_key(dt: datetime) -> str:
 
 
 def month_label(dt: datetime) -> str:
-    # Formato como en el ejemplo: "February 2026" o corto "Feb 2026"
     fmt = os.environ.get("FORECAST_MONTH_LABEL", "short").strip().lower()
+    # short -> "Feb 2025", long -> "February 2025"
     return dt.strftime("%b %Y") if fmt == "short" else dt.strftime("%B %Y")
 
 
 def iter_month_starts(start_date: str, end_date: str) -> List[datetime]:
     """
-    Devuelve una lista de fechas (1er día del mes) desde start_date hasta end_date inclusive.
+    Lista de fechas (1er día de cada mes) desde start_date hasta end_date inclusive.
     """
     sdt = datetime.fromisoformat(start_date)
     edt = datetime.fromisoformat(end_date)
@@ -86,7 +89,7 @@ def iter_month_starts(start_date: str, end_date: str) -> List[datetime]:
     cur = sdt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     end = edt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-    out = []
+    out: List[datetime] = []
     while cur <= end:
         out.append(cur)
         # sumar 1 mes sin librerías extra
@@ -94,6 +97,25 @@ def iter_month_starts(start_date: str, end_date: str) -> List[datetime]:
         m = (cur.month % 12) + 1
         cur = cur.replace(year=y, month=m)
     return out
+
+
+def safe_int(x: Any) -> int:
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return 0
+
+
+def clean_mpn(raw: str) -> str:
+    """
+    Convierte 'KM10 (279)' -> 'KM10'
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if "(" in s:
+        s = s.split("(", 1)[0].strip()
+    return s
 
 
 def shipstation_get(url: str, params: Dict[str, Any], auth: Tuple[str, str], retries: int = 4) -> Dict[str, Any]:
@@ -109,6 +131,7 @@ def shipstation_get(url: str, params: Dict[str, Any], auth: Tuple[str, str], ret
                     f"429 rate limit. Sleep {sleep_s}s (attempt {attempt}/{retries})")
                 time.sleep(sleep_s)
                 continue
+
             r.raise_for_status()
             return r.json() if r.content else {}
         except Exception as e:
@@ -154,11 +177,42 @@ def get_order(order_id: Any, auth: Tuple[str, str], cache: Dict[str, Dict[str, A
     oid = str(order_id)
     if oid in cache:
         return cache[oid]
-
-    url = f"{ORDER_URL}/{oid}"
-    data = shipstation_get(url, params={}, auth=auth)
+    data = shipstation_get(f"{ORDER_URL}/{oid}", params={}, auth=auth)
     cache[oid] = data
     return data
+
+
+def get_product(product_id: Any, auth: Tuple[str, str], cache: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    pid = str(product_id)
+    if pid in cache:
+        return cache[pid]
+    data = shipstation_get(f"{PRODUCT_URL}/{pid}", params={}, auth=auth)
+    cache[pid] = data
+    return data
+
+
+def resolve_master_sku(item: Dict[str, Any], auth: Tuple[str, str], product_cache: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
+    """
+    Returns: (master_sku, product_id_str)
+    master_sku = products/{productId}.sku
+    Fallback (si falla): item.sku
+    """
+    channel_sku = (item.get("sku") or "").strip()
+    pid = item.get("productId")
+
+    if pid is None:
+        return channel_sku, ""
+
+    pid_s = str(pid)
+    try:
+        prod = get_product(pid_s, auth=auth, cache=product_cache)
+        master = (prod.get("sku") or "").strip()
+        if master:
+            return master, pid_s
+    except Exception as e:
+        logger.warning(f"Product lookup failed productId={pid_s}: {e}")
+
+    return channel_sku, pid_s
 
 
 def connect_sheet(service_account_json_path: str):
@@ -179,11 +233,6 @@ def overwrite_worksheet(ws, values: List[List[Any]]):
     ws.clear()
     if values:
         ws.update(values, value_input_option="RAW")
-
-
-def best_mpn_for_item(item: Dict[str, Any]) -> str:
-    # “MPN” según vuestro criterio previo: warehouseLocation o fulfillmentSku
-    return (item.get("warehouseLocation") or item.get("fulfillmentSku") or "").strip()
 
 
 def main():
@@ -208,11 +257,16 @@ def main():
 
     logger.info(f"Forecast range shipDate: {ship_start} .. {ship_end}")
 
+    # -------------------------
+    # Phase 1: Fulfillments
+    # -------------------------
     t0 = time.time()
     fulfillments = list_fulfillments(ship_start, ship_end, auth=auth)
     logger.info(f"Phase 1 done (fulfillments). elapsed={time.time()-t0:.1f}s")
 
-    # Agrupar por orderId y tomar shipDate más reciente por orderId
+    # -------------------------
+    # Phase 2: Unique orders (orderId -> latest shipDate)
+    # -------------------------
     t1 = time.time()
     order_shipdate: Dict[str, datetime] = {}
     for f in fulfillments:
@@ -235,23 +289,27 @@ def main():
         logger.warning(
             f"FORECAST_MAX_ORDERS active -> processing only first {max_orders} orders")
 
-    # Cache de orders
+    # -------------------------
+    # Phase 3: Orders -> items -> master SKU
+    # -------------------------
     order_cache: Dict[str, Dict[str, Any]] = {}
+    product_cache: Dict[str, Dict[str, Any]] = {}
 
-    # RAW + AGG
-    raw_rows: List[List[Any]] = [["ShipDate", "Month",
-                                  "OrderNumber", "OrderId", "SKU", "Qty", "MPN"]]
+    # RAW audit rows
+    raw_rows: List[List[Any]] = [[
+        "ShipDate", "Month", "OrderNumber", "OrderId",
+        "ChannelSKU", "ProductId", "MasterSKU", "Qty", "MPN"
+    ]]
+
+    # AGG (Month, MasterSKU)
     agg: Dict[Tuple[str, str], int] = defaultdict(int)
 
-    # Para matriz: SKU x Month -> Qty
+    # MATRIX (MasterSKU x Month)
     pivot: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
-    # Para MPN por SKU: elegimos el más frecuente observado
-    mpn_counter_by_sku: Dict[str, Counter] = defaultdict(Counter)
+    # MPN per master sku (most common)
+    mpn_counter_by_master: Dict[str, Counter] = defaultdict(Counter)
 
-    # -------------------------
-    # Descarga orders (fase lenta) + progreso
-    # -------------------------
     t2 = time.time()
     for i, (order_id, ship_dt) in enumerate(unique_orders, start=1):
         order = get_order(order_id, auth=auth, cache=order_cache)
@@ -260,60 +318,70 @@ def main():
 
         items = order.get("items") or []
         for it in items:
-            sku = (it.get("sku") or "").strip()
-            if not sku:
+            qty = safe_int(it.get("quantity", 0))
+
+            channel_sku = (it.get("sku") or "").strip()
+            master_sku, pid_s = resolve_master_sku(
+                it, auth=auth, product_cache=product_cache)
+
+            if not master_sku:
                 continue
 
-            raw_qty = it.get("quantity", 0)
-            try:
-                qty = int(float(raw_qty))
-            except (TypeError, ValueError):
-                qty = 0
-
-            mpn = best_mpn_for_item(it)
+            # MPN (warehouse location cleaned) fallback to fulfillmentSku
+            mpn_raw = it.get("warehouseLocation") or it.get(
+                "fulfillmentSku") or ""
+            mpn = clean_mpn(str(mpn_raw))
 
             raw_rows.append([
                 ship_dt.strftime("%Y-%m-%d"),
                 mkey,
                 order_number,
                 str(order_id),
-                sku,
+                channel_sku,
+                pid_s,
+                master_sku,
                 qty,
                 mpn,
             ])
 
-            agg[(mkey, sku)] += qty
-            pivot[sku][mkey] += qty
+            agg[(mkey, master_sku)] += qty
+            pivot[master_sku][mkey] += qty
 
             if mpn:
-                mpn_counter_by_sku[sku][mpn] += 1
+                mpn_counter_by_master[master_sku][mpn] += 1
 
         if progress_every and (i % progress_every == 0):
             logger.info(
-                f"Processed {i}/{len(unique_orders)} orders | cached={len(order_cache)} | raw_lines={len(raw_rows)-1}"
+                f"Processed {i}/{len(unique_orders)} orders | orders_cached={len(order_cache)} "
+                f"| products_cached={len(product_cache)} | raw_lines={len(raw_rows)-1}"
             )
 
-    logger.info(f"Phase 3 done (orders->lines). elapsed={time.time()-t2:.1f}s")
+    logger.info(
+        f"Phase 3 done (orders->lines->masterSKU). elapsed={time.time()-t2:.1f}s")
 
-    # AGG rows (long)
+    # -------------------------
+    # Build MONTHLY_SKU (long)
+    # -------------------------
     agg_rows: List[List[Any]] = [["Month", "SKU", "QtyShipped"]]
     for (m, sku), qty in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
         agg_rows.append([m, sku, qty])
 
-    # MATRIX rows (wide)
+    # -------------------------
+    # Build FORECAST_MATRIX (wide)
+    # -------------------------
     month_starts = iter_month_starts(ship_start, ship_end)
     month_keys = [dt.strftime("%Y-%m") for dt in month_starts]
     month_labels = [month_label(dt) for dt in month_starts]
 
-    matrix_rows: List[List[Any]] = []
     header = ["SKU", "MPN"] + month_labels
-    matrix_rows.append(header)
+    matrix_rows: List[List[Any]] = [header]
 
     for sku in sorted(pivot.keys()):
-        # MPN “mejor” (más frecuente)
+        # pick most common MPN for this master sku
         mpn = ""
-        if sku in mpn_counter_by_sku and mpn_counter_by_sku[sku]:
-            mpn = mpn_counter_by_sku[sku].most_common(1)[0][0]
+        c = mpn_counter_by_master.get(sku)
+        if c and len(c) > 0:
+            mpn = c.most_common(1)[0][0]
 
         row = [sku, mpn]
         sku_months = pivot.get(sku, {})
@@ -322,7 +390,7 @@ def main():
         matrix_rows.append(row)
 
     # -------------------------
-    # Write to Google Sheets
+    # Write to Google Sheets (overwrites these 3 tabs)
     # -------------------------
     t3 = time.time()
     sh = connect_sheet(sa_path)
